@@ -16,6 +16,7 @@ const {
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   PermissionFlagsBits,
+  MessageFlags,
   ChannelType,
   REST,
   Routes,
@@ -120,6 +121,7 @@ async function verifyPayPayLink(url, expectedAmount) {
   }
 
   const apiUrl = `https://www.paypay.ne.jp/portal/api/v1/order/link/info?linkId=${linkId}`;
+  console.log(`PayPayリンク検証: 入力URL=${url} / host=${new URL(url).hostname} / 抽出linkId=${linkId} / リクエストURL=${apiUrl}`);
   try {
     const response = await fetch(apiUrl, {
       headers: {
@@ -130,7 +132,7 @@ async function verifyPayPayLink(url, expectedAmount) {
     if (!response.ok) {
       const bodyText = await response.text().catch(() => '(本文取得不可)');
       console.error(`PayPay APIリクエスト失敗: status=${response.status} ${response.statusText} / linkId=${linkId} / body=${bodyText.slice(0, 500)}`);
-      return { valid: false, reason: `PayPayのAPIリクエストが失敗しました。(status: ${response.status})` };
+      return { valid: false, unverifiable: true, reason: `PayPayの自動検証APIに接続できませんでした。(status: ${response.status})` };
     }
 
     const json = await response.json();
@@ -157,7 +159,7 @@ async function verifyPayPayLink(url, expectedAmount) {
     return { valid: true, amount };
   } catch (error) {
     console.error('PayPay検証エラー:', error);
-    return { valid: false, reason: 'PayPay検証処理中にエラーが発生しました。' };
+    return { valid: false, unverifiable: true, reason: 'PayPay検証処理中にエラーが発生しました（自動検証APIへの接続に問題がある可能性があります）。' };
   }
 }
 
@@ -445,7 +447,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(vendingId));
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '商品の追加処理中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '商品の追加処理中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -456,13 +458,13 @@ client.on('interactionCreate', async interaction => {
       try {
         const res = await pool.query('DELETE FROM products WHERE id = $1 RETURNING vending_id', [id]);
         if (res.rowCount === 0) {
-          return interaction.reply({ content: `商品ID: ${id} は存在しません。`, ephemeral: true });
+          return interaction.reply({ content: `商品ID: ${id} は存在しません。`, flags: MessageFlags.Ephemeral });
         }
         const deletedVendingId = res.rows[0].vending_id;
         return interaction.reply({ content: `商品ID: ${id} を削除しました。` }).then(() => refreshVendingPanels(deletedVendingId));
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '商品の削除中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '商品の削除中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -474,7 +476,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const res = await pool.query('SELECT name, vending_id, stock FROM products WHERE id = $1', [id]);
         if (res.rowCount === 0) {
-          return interaction.reply({ content: `商品ID: ${id} が見つかりません。先に vending-add で登録してください。`, ephemeral: true });
+          return interaction.reply({ content: `商品ID: ${id} が見つかりません。先に vending-add で登録してください。`, flags: MessageFlags.Ephemeral });
         }
 
         const newItems = itemsInput.split(/,|\n/).map(item => item.trim()).filter(item => item.length > 0);
@@ -494,7 +496,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(vendingId));
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '在庫の追加中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '在庫の追加中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -507,7 +509,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [panel.embed], components: panel.rows });
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '自販機リストの読み込み中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '自販機リストの読み込み中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -526,16 +528,16 @@ client.on('interactionCreate', async interaction => {
         );
 
         const noticeSuffix = panel.isEmpty ? '（現在商品は未登録です。vending-add で商品を追加すると自動的に反映されます）' : '';
-        return interaction.reply({ content: `自販機「${vendingId}」のパネルをこのチャンネルに設置しました。${noticeSuffix}`, ephemeral: true });
+        return interaction.reply({ content: `自販機「${vendingId}」のパネルをこのチャンネルに設置しました。${noticeSuffix}`, flags: MessageFlags.Ephemeral });
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '自販機パネルの設置中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '自販機パネルの設置中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
     // 4.6 vending-refresh-all（管理者用 設置済みの全自販機パネルを一斉更新。購入方式やパネル表示を変更した際にまとめて反映するためのもの）
     if (commandName === 'vending-refresh-all') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
         const result = await refreshAllVendingPanels();
@@ -605,7 +607,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] });
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '設定の保存中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '設定の保存中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -623,7 +625,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] });
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '設定の保存中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '設定の保存中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
   }
@@ -639,7 +641,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const res = await pool.query('SELECT * FROM products WHERE vending_id = $1 ORDER BY name', [vendingId]);
         if (res.rowCount === 0) {
-          return interaction.reply({ content: 'この自販機には現在商品が登録されていません。', ephemeral: true });
+          return interaction.reply({ content: 'この自販機には現在商品が登録されていません。', flags: MessageFlags.Ephemeral });
         }
 
         // Discordのセレクトメニューは最大25件までしか選択肢を持てないため先頭25件に制限
@@ -666,10 +668,10 @@ client.on('interactionCreate', async interaction => {
           .setDescription('購入したい商品を下のメニューから選択してください。この内容はあなたにしか表示されていません。')
           .setColor(0x8A2BE2);
 
-        return interaction.reply({ embeds: [embed], components: [selectRow], ephemeral: true });
+        return interaction.reply({ embeds: [embed], components: [selectRow], flags: MessageFlags.Ephemeral });
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '商品選択メニューの表示中にエラーが発生しました。', ephemeral: true });
+        return interaction.reply({ content: '商品選択メニューの表示中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -680,7 +682,7 @@ client.on('interactionCreate', async interaction => {
 
       const existingChannel = guild.channels.cache.find(c => c.name === `ticket-${user.username.toLowerCase()}`);
       if (existingChannel) {
-        return interaction.reply({ content: `既に作成済みのチケットチャンネルがあります: ${existingChannel}`, ephemeral: true });
+        return interaction.reply({ content: `既に作成済みのチケットチャンネルがあります: ${existingChannel}`, flags: MessageFlags.Ephemeral });
       }
 
       try {
@@ -699,7 +701,7 @@ client.on('interactionCreate', async interaction => {
           ]
         });
 
-        await interaction.reply({ content: `チケットを作成しました: ${ticketChannel}`, ephemeral: true });
+        await interaction.reply({ content: `チケットを作成しました: ${ticketChannel}`, flags: MessageFlags.Ephemeral });
 
         const welcomeEmbed = new EmbedBuilder()
           .setTitle('サポートへようこそ')
@@ -718,7 +720,7 @@ client.on('interactionCreate', async interaction => {
 
       } catch (error) {
         console.error('チケット作成エラー:', error);
-        return interaction.reply({ content: 'チケットチャンネルの作成中にエラーが発生しました。ボットの権限を確認してください。', ephemeral: true });
+        return interaction.reply({ content: 'チケットチャンネルの作成中にエラーが発生しました。ボットの権限を確認してください。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -876,7 +878,7 @@ client.on('interactionCreate', async interaction => {
       } catch (error) {
         await dbClient.query('ROLLBACK');
         console.error('承認/却下処理エラー:', error);
-        return interaction.followUp({ content: `処理に失敗しました: ${error.message}`, ephemeral: true }).catch(() => null);
+        return interaction.followUp({ content: `処理に失敗しました: ${error.message}`, flags: MessageFlags.Ephemeral }).catch(() => null);
       } finally {
         dbClient.release();
       }
@@ -979,7 +981,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.showModal(modal);
       } catch (err) {
         console.error(err);
-        return interaction.reply({ content: '購入処理の開始中にエラーが発生しました。', ephemeral: true }).catch(() => null);
+        return interaction.reply({ content: '購入処理の開始中にエラーが発生しました。', flags: MessageFlags.Ephemeral }).catch(() => null);
       }
     }
     return;
@@ -994,7 +996,7 @@ client.on('interactionCreate', async interaction => {
       const vouchChannelId = settings.vouch_channel_id;
 
       if (!vouchChannelId) {
-        return interaction.reply({ content: '実績報告を受け取るチャンネルが設定されていません。管理者が 実績受け取り コマンドを実行して設定してください。', ephemeral: true });
+        return interaction.reply({ content: '実績報告を受け取るチャンネルが設定されていません。管理者が 実績受け取り コマンドを実行して設定してください。', flags: MessageFlags.Ephemeral });
       }
 
       const product = interaction.fields.getTextInputValue('vouch_product');
@@ -1004,7 +1006,7 @@ client.on('interactionCreate', async interaction => {
 
       const vouchChannel = interaction.guild.channels.cache.get(vouchChannelId);
       if (!vouchChannel) {
-        return interaction.reply({ content: '設定された実績受け取りチャンネルが見つかりませんでした。再度 実績受け取り コマンドで設定し直してください。', ephemeral: true });
+        return interaction.reply({ content: '設定された実績受け取りチャンネルが見つかりませんでした。再度 実績受け取り コマンドで設定し直してください。', flags: MessageFlags.Ephemeral });
       }
 
       const clampedRating = Math.max(1, Math.min(5, parseInt(ratingVal) || 5));
@@ -1024,10 +1026,10 @@ client.on('interactionCreate', async interaction => {
 
       try {
         await vouchChannel.send({ embeds: [embed] });
-        return interaction.reply({ content: '実績を報告しました。ご協力ありがとうございました。', ephemeral: true });
+        return interaction.reply({ content: '実績を報告しました。ご協力ありがとうございました。', flags: MessageFlags.Ephemeral });
       } catch (error) {
         console.error('実績送信エラー:', error);
-        return interaction.reply({ content: '実績の送信中にエラーが発生しました。ボットの権限を確認してください。', ephemeral: true });
+        return interaction.reply({ content: '実績の送信中にエラーが発生しました。ボットの権限を確認してください。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -1039,21 +1041,23 @@ client.on('interactionCreate', async interaction => {
       try {
         const prodRes = await pool.query('SELECT * FROM products WHERE id = $1', [prodId]);
         if (prodRes.rowCount === 0) {
-          return interaction.reply({ content: 'この商品は存在しないか、既に削除されています。', ephemeral: true });
+          return interaction.reply({ content: 'この商品は存在しないか、既に削除されています。', flags: MessageFlags.Ephemeral });
         }
 
         const prod = prodRes.rows[0];
 
         const paymentChannel = interaction.guild.channels.cache.get(settings.payment_channel_id);
         if (!paymentChannel) {
-          return interaction.reply({ content: '決済確認チャンネルが見つかりません。管理者に確認してください。', ephemeral: true });
+          return interaction.reply({ content: '決済確認チャンネルが見つかりません。管理者に確認してください。', flags: MessageFlags.Ephemeral });
         }
 
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         // PayPay自動検証
         const validation = await verifyPayPayLink(paypayUrl, prod.price);
-        if (!validation.valid) {
+        // linkの形式不正・金額不一致・使用済みなど「明確に無効」な場合のみブロックする。
+        // API自体に接続できない（unverifiable）場合は自動検証を諦めて、管理者の手動確認に委ねる。
+        if (!validation.valid && !validation.unverifiable) {
           return interaction.editReply({ content: `申請を送信できませんでした: ${validation.reason}` });
         }
 
@@ -1066,8 +1070,8 @@ client.on('interactionCreate', async interaction => {
         `, [transactionId, interaction.user.id, prodId, paypayUrl, Date.now()]);
 
         const requestEmbed = new EmbedBuilder()
-          .setTitle('購入申請 (PayPay支払い)')
-          .setColor(0xF39C12)
+          .setTitle(validation.unverifiable ? '購入申請 (PayPay支払い) ⚠️自動検証不可' : '購入申請 (PayPay支払い)')
+          .setColor(validation.unverifiable ? 0xE67E22 : 0xF39C12)
           .addFields(
             { name: '購入者', value: `${interaction.user} (${interaction.user.tag})`, inline: true },
             { name: '商品名', value: prod.name, inline: true },
@@ -1075,6 +1079,13 @@ client.on('interactionCreate', async interaction => {
             { name: 'PayPay送金リンク', value: paypayUrl }
           )
           .setTimestamp();
+
+        if (validation.unverifiable) {
+          requestEmbed.addFields({
+            name: '⚠️ 注意',
+            value: `PayPayの自動検証に失敗したため、金額・状態の自動チェックができていません（${validation.reason}）。承認前に必ず送金リンクの内容とスクリーンショット等をご自身で確認してください。`
+          });
+        }
 
         const buttons = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -1088,11 +1099,15 @@ client.on('interactionCreate', async interaction => {
         );
 
         await paymentChannel.send({ embeds: [requestEmbed], components: [buttons] });
-        return interaction.editReply({ content: '購入申請を送信しました。管理者がPayPayの支払いを確認次第、商品がDM宛てに送信されます。しばらくお待ちください。' });
+
+        const replyMsg = validation.unverifiable
+          ? '購入申請を送信しました（今回は自動検証ができなかったため、管理者による手動確認となります）。しばらくお待ちください。'
+          : '購入申請を送信しました。管理者がPayPayの支払いを確認次第、商品がDM宛てに送信されます。しばらくお待ちください。';
+        return interaction.editReply({ content: replyMsg });
 
       } catch (error) {
         console.error(error);
-        return interaction.reply({ content: '申請の処理中にエラーが発生しました。', ephemeral: true }).catch(() => null);
+        return interaction.reply({ content: '申請の処理中にエラーが発生しました。', flags: MessageFlags.Ephemeral }).catch(() => null);
       }
     }
   }
