@@ -204,12 +204,11 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 
-async function registerCommands() {
+async function registerCommands(clientId) {
   const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.CLIENT_ID;
 
-  if (!token || !clientId || token.includes('YOUR_DISCORD') || clientId.includes('YOUR_DISCORD')) {
-    console.warn('警告: DISCORD_TOKEN または CLIENT_ID が設定されていません。');
+  if (!token || token.includes('YOUR_DISCORD')) {
+    console.warn('警告: DISCORD_TOKEN が設定されていません。');
     return;
   }
 
@@ -230,7 +229,10 @@ async function registerCommands() {
 client.once('ready', async () => {
   console.log(`ログインしました: ${client.user.tag}`);
   await initDb();
-  await registerCommands();
+  
+  // ログイン情報からアプリケーションID（クライアントID）を自動で取得
+  const clientId = client.application.id;
+  await registerCommands(clientId);
 });
 
 client.on('interactionCreate', async interaction => {
