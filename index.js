@@ -1,3 +1,7 @@
+const dns = require('dns');
+// Render等のIPv6環境がないサーバーでSupabaseへの接続エラー(ENETUNREACH)を防ぐため、IPv4を優先に設定
+dns.setDefaultResultOrder('ipv4first');
+
 const {
   Client,
   GatewayIntentBits,
@@ -21,9 +25,7 @@ require('dotenv').config();
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.GuildMessages
   ],
   partials: [Partials.Channel, Partials.Message, Partials.User]
 });
@@ -230,9 +232,27 @@ client.once('ready', async () => {
   console.log(`ログインしました: ${client.user.tag}`);
   await initDb();
   
+  // 許可されたサーバー以外のギルドから退出する
+  const ALLOWED_GUILD_ID = '1528260161683062826';
+  client.guilds.cache.forEach(async (guild) => {
+    if (guild.id !== ALLOWED_GUILD_ID) {
+      console.log(`許可されていないサーバー (${guild.name} / ID: ${guild.id}) から退出します。`);
+      await guild.leave().catch(err => console.error('サーバー退出エラー:', err));
+    }
+  });
+
   // ログイン情報からアプリケーションID（クライアントID）を自動で取得
   const clientId = client.application.id;
   await registerCommands(clientId);
+});
+
+// 新しいサーバーに追加されたときの処理
+client.on('guildCreate', async (guild) => {
+  const ALLOWED_GUILD_ID = '1528260161683062826';
+  if (guild.id !== ALLOWED_GUILD_ID) {
+    console.log(`許可されていないサーバー (${guild.name} / ID: ${guild.id}) に追加されたため、即座に退出します。`);
+    await guild.leave().catch(err => console.error('サーバー退出エラー:', err));
+  }
 });
 
 client.on('interactionCreate', async interaction => {
