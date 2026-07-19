@@ -128,7 +128,9 @@ async function verifyPayPayLink(url, expectedAmount) {
     });
 
     if (!response.ok) {
-      return { valid: false, reason: 'PayPayのAPIリクエストが失敗しました。' };
+      const bodyText = await response.text().catch(() => '(本文取得不可)');
+      console.error(`PayPay APIリクエスト失敗: status=${response.status} ${response.statusText} / linkId=${linkId} / body=${bodyText.slice(0, 500)}`);
+      return { valid: false, reason: `PayPayのAPIリクエストが失敗しました。(status: ${response.status})` };
     }
 
     const json = await response.json();
@@ -480,7 +482,7 @@ client.on('interactionCreate', async interaction => {
         const updatedStock = [...currentStock, ...newItems];
         const vendingId = res.rows[0].vending_id;
 
-        await pool.query('UPDATE products SET stock = $1 WHERE id = $2', [updatedStock, id]);
+        await pool.query('UPDATE products SET stock = $1::text[] WHERE id = $2', [updatedStock, id]);
 
         const embed = new EmbedBuilder()
           .setTitle('在庫追加完了')
@@ -822,7 +824,7 @@ client.on('interactionCreate', async interaction => {
             purchasedItem = stock.shift();
 
             // 在庫の更新（在庫∞商品は更新不要なので通常商品のみ）
-            await dbClient.query('UPDATE products SET stock = $1 WHERE id = $2', [stock, prodId]);
+            await dbClient.query('UPDATE products SET stock = $1::text[] WHERE id = $2', [stock, prodId]);
           }
 
           // DM送信処理
@@ -921,7 +923,7 @@ client.on('interactionCreate', async interaction => {
               }
               const stock = [...lockedProd.stock];
               deliveredItem = stock.shift();
-              await dbClient.query('UPDATE products SET stock = $1 WHERE id = $2', [stock, prodId]);
+              await dbClient.query('UPDATE products SET stock = $1::text[] WHERE id = $2', [stock, prodId]);
             }
 
             await dbClient.query('COMMIT');
