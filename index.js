@@ -69,6 +69,16 @@ async function initDb() {
       );
     `);
     await dbClient.query(`
+      CREATE TABLE IF NOT EXISTS vending_panels (
+        message_id VARCHAR(255) PRIMARY KEY,
+        channel_id VARCHAR(255) NOT NULL,
+        vending_id VARCHAR(255) NOT NULL
+      );
+    `);
+    await dbClient.query(`
+      CREATE INDEX IF NOT EXISTS idx_vending_panels_vending_id ON vending_panels (vending_id);
+    `);
+    await dbClient.query(`
       INSERT INTO settings (key, vouch_channel_id, payment_channel_id)
       VALUES ('guildSettings', NULL, NULL)
       ON CONFLICT (key) DO NOTHING;
@@ -155,6 +165,83 @@ async function getSettings() {
   }
 }
 
+// 自販機パネル（embed + 購入ボタン）生成ヘルパー
+// 商品が0件の自販機IDでも「商品なし」パネルを返す（設置後に商品を追加すれば自動反映されるため）
+async function buildVendingPanel(vendingId) {
+  const res = await pool.query('SELECT * FROM products WHERE vending_id = $1', [vendingId]);
+
+  if (res.rowCount === 0) {
+    const embed = new EmbedBuilder()
+      .setTitle(`ShopKura オンライン自販機 (自販機ID: ${vendingId})`)
+      .setDescription('現在この自販機には商品が登録されていません。商品が追加され次第、このパネルは自動的に更新されます。')
+      .setColor(0x8A2BE2)
+      .setTimestamp();
+    return { isEmpty: true, embed, rows: [] };
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`ShopKura オンライン自販機 (自販機ID: ${vendingId})`)
+    .setDescription('購入したい商品の購入ボタンを押してください。お支払いはPayPay送金リンクのみ受け付けております。')
+    .setColor(0x8A2BE2)
+    .setTimestamp();
+
+  const rows = [];
+  let currentRow = new ActionRowBuilder();
+
+  res.rows.forEach((prod, index) => {
+    embed.addFields({
+      name: `${prod.name} (${prod.price} 円)`,
+      value: `商品ID: ${prod.id} | 在庫: ${prod.stock ? prod.stock.length : 0} 個\n説明: ${prod.description}`
+    });
+
+    const btn = new ButtonBuilder()
+      .setCustomId(`buy_${prod.id}`)
+      .setLabel(`購入: ${prod.name}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!prod.stock || prod.stock.length === 0);
+
+    currentRow.addComponents(btn);
+
+    if ((index + 1) % 5 === 0 || index === res.rowCount - 1) {
+      rows.push(currentRow);
+      currentRow = new ActionRowBuilder();
+    }
+  });
+
+  return { isEmpty: false, embed, rows };
+}
+
+// 自販機ごとに複数設置されたパネル（複数チャンネル・複数メッセージ）を全て最新の在庫状態に同期する
+async function refreshVendingPanels(vendingId) {
+  if (!vendingId) return;
+
+  try {
+    const res = await pool.query('SELECT channel_id, message_id FROM vending_panels WHERE vending_id = $1', [vendingId]);
+    if (res.rowCount === 0) return;
+
+    const panel = await buildVendingPanel(vendingId);
+
+    for (const row of res.rows) {
+      try {
+        const channel = await client.channels.fetch(row.channel_id);
+        const message = await channel.messages.fetch(row.message_id);
+        await message.edit({ embeds: [panel.embed], components: panel.rows });
+      } catch (err) {
+        // チャンネルやメッセージが手動削除されている場合は設置記録をクリーンアップする
+        await pool.query('DELETE FROM vending_panels WHERE message_id = $1', [row.message_id]).catch(() => null);
+      }
+    }
+  } catch (err) {
+    console.error('自販機パネル自動更新エラー:', err);
+  }
+}
+
+// 自販機ID(1～10)の選択肢。全ての vending_id 系オプションで共通利用する
+const VENDING_ID_CHOICES = Array.from({ length: 10 }, (_, i) => ({
+  name: `自販機 ${i + 1}`,
+  value: `${i + 1}`
+}));
+
 // スラッシュコマンド定義
 const commands = [
   new SlashCommandBuilder()
@@ -162,10 +249,11 @@ const commands = [
     .setDescription('管理者用 新しい商品を追加します')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(option => option.setName('id').setDescription('商品ID').setRequired(true))
-    .addStringOption(option => option.setName('vending_id').setDescription('自販機ID（複数の自販機を分ける用）').setRequired(true))
+    .addStringOption(option => option.setName('vending_id').setDescription('自販機番号（1～10）').setRequired(true).addChoices(...VENDING_ID_CHOICES))
     .addStringOption(option => option.setName('name').setDescription('商品名').setRequired(true))
     .addIntegerOption(option => option.setName('price').setDescription('価格（円）').setRequired(true))
-    .addStringOption(option => option.setName('description').setDescription('商品の説明').setRequired(true)),
+    .addStringOption(option => option.setName('description').setDescription('商品の説明').setRequired(true))
+    .addBooleanOption(option => option.setName('infinite_stock').setDescription('在庫を∞（無限）にする場合はTrue。売り切れなしで購入し続けられます').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('vending-delete')
@@ -182,8 +270,14 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('vending-list')
-    .setDescription('指定した自販機IDの商品一覧を表示します')
-    .addStringOption(option => option.setName('vending_id').setDescription('表示する自販機ID').setRequired(true)),
+    .setDescription('指定した自販機番号の商品一覧を表示します')
+    .addStringOption(option => option.setName('vending_id').setDescription('表示する自販機番号（1～10）').setRequired(true).addChoices(...VENDING_ID_CHOICES)),
+
+  new SlashCommandBuilder()
+    .setName('vending-setup')
+    .setDescription('管理者用 このチャンネルに自販機パネルを設置します（1～10それぞれ別の商品を販売可能）')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(option => option.setName('vending_id').setDescription('設置する自販機番号（1～10）').setRequired(true).addChoices(...VENDING_ID_CHOICES)),
 
   new SlashCommandBuilder()
     .setName('ticket-setup')
@@ -256,6 +350,24 @@ client.on('guildCreate', async (guild) => {
 });
 
 client.on('interactionCreate', async interaction => {
+  // 自販機ID入力補完（複数設置している自販機IDを一覧から選択できるようにする）
+  if (interaction.isAutocomplete()) {
+    if (['vending-add', 'vending-list', 'vending-setup'].includes(interaction.commandName)) {
+      const focusedValue = interaction.options.getFocused() || '';
+      try {
+        const res = await pool.query(
+          'SELECT DISTINCT vending_id FROM products WHERE vending_id ILIKE $1 ORDER BY vending_id LIMIT 25',
+          [`%${focusedValue}%`]
+        );
+        await interaction.respond(res.rows.map(row => ({ name: row.vending_id, value: row.vending_id })));
+      } catch (err) {
+        console.error('自販機ID自動補完エラー:', err);
+        await interaction.respond([]).catch(() => null);
+      }
+    }
+    return;
+  }
+
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -287,7 +399,7 @@ client.on('interactionCreate', async interaction => {
           )
           .setTimestamp();
 
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(vendingId));
       } catch (err) {
         console.error(err);
         return interaction.reply({ content: '商品の追加処理中にエラーが発生しました。', ephemeral: true });
@@ -299,11 +411,12 @@ client.on('interactionCreate', async interaction => {
       const id = interaction.options.getString('id');
 
       try {
-        const res = await pool.query('DELETE FROM products WHERE id = $1', [id]);
+        const res = await pool.query('DELETE FROM products WHERE id = $1 RETURNING vending_id', [id]);
         if (res.rowCount === 0) {
           return interaction.reply({ content: `商品ID: ${id} は存在しません。`, ephemeral: true });
         }
-        return interaction.reply({ content: `商品ID: ${id} を削除しました。` });
+        const deletedVendingId = res.rows[0].vending_id;
+        return interaction.reply({ content: `商品ID: ${id} を削除しました。` }).then(() => refreshVendingPanels(deletedVendingId));
       } catch (err) {
         console.error(err);
         return interaction.reply({ content: '商品の削除中にエラーが発生しました。', ephemeral: true });
@@ -316,7 +429,7 @@ client.on('interactionCreate', async interaction => {
       const itemsInput = interaction.options.getString('items');
 
       try {
-        const res = await pool.query('SELECT name, stock FROM products WHERE id = $1', [id]);
+        const res = await pool.query('SELECT name, vending_id, stock FROM products WHERE id = $1', [id]);
         if (res.rowCount === 0) {
           return interaction.reply({ content: `商品ID: ${id} が見つかりません。先に vending-add で登録してください。`, ephemeral: true });
         }
@@ -324,6 +437,7 @@ client.on('interactionCreate', async interaction => {
         const newItems = itemsInput.split(/,|\n/).map(item => item.trim()).filter(item => item.length > 0);
         const currentStock = res.rows[0].stock || [];
         const updatedStock = [...currentStock, ...newItems];
+        const vendingId = res.rows[0].vending_id;
 
         await pool.query('UPDATE products SET stock = $1 WHERE id = $2', [updatedStock, id]);
 
@@ -334,7 +448,7 @@ client.on('interactionCreate', async interaction => {
           .addFields({ name: '現在の総在庫数', value: `${updatedStock.length} 個` })
           .setTimestamp();
 
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(vendingId));
       } catch (err) {
         console.error(err);
         return interaction.reply({ content: '在庫の追加中にエラーが発生しました。', ephemeral: true });
@@ -346,44 +460,33 @@ client.on('interactionCreate', async interaction => {
       const vendingId = interaction.options.getString('vending_id');
 
       try {
-        const res = await pool.query('SELECT * FROM products WHERE vending_id = $1', [vendingId]);
-        if (res.rowCount === 0) {
-          return interaction.reply({ content: `自販機ID: ${vendingId} に登録されている商品は現在ありません。`, ephemeral: true });
-        }
-
-        const embed = new EmbedBuilder()
-          .setTitle(`ShopKura オンライン自販機 (自販機ID: ${vendingId})`)
-          .setDescription('購入したい商品の購入ボタンを押してください。お支払いはPayPay送金リンクのみ受け付けております。')
-          .setColor(0x8A2BE2)
-          .setTimestamp();
-
-        const rows = [];
-        let currentRow = new ActionRowBuilder();
-
-        res.rows.forEach((prod, index) => {
-          embed.addFields({
-            name: `${prod.name} (${prod.price} 円)`,
-            value: `商品ID: ${prod.id} | 在庫: ${prod.stock ? prod.stock.length : 0} 個\n説明: ${prod.description}`
-          });
-
-          const btn = new ButtonBuilder()
-            .setCustomId(`buy_${prod.id}`)
-            .setLabel(`購入: ${prod.name}`)
-            .setStyle(ButtonStyle.Primary)
-            .setDisabled(!prod.stock || prod.stock.length === 0);
-
-          currentRow.addComponents(btn);
-
-          if ((index + 1) % 5 === 0 || index === res.rowCount - 1) {
-            rows.push(currentRow);
-            currentRow = new ActionRowBuilder();
-          }
-        });
-
-        return interaction.reply({ embeds: [embed], components: rows });
+        const panel = await buildVendingPanel(vendingId);
+        return interaction.reply({ embeds: [panel.embed], components: panel.rows });
       } catch (err) {
         console.error(err);
         return interaction.reply({ content: '自販機リストの読み込み中にエラーが発生しました。', ephemeral: true });
+      }
+    }
+
+    // 4.5 vending-setup（管理者用 自販機パネルの設置。同じIDでも別IDでも複数チャンネルに設置可能）
+    if (commandName === 'vending-setup') {
+      const vendingId = interaction.options.getString('vending_id');
+
+      try {
+        const panel = await buildVendingPanel(vendingId);
+        const sentMessage = await interaction.channel.send({ embeds: [panel.embed], components: panel.rows });
+
+        // 設置場所をDBに記録し、以後この自販機IDの商品が変わるたびに自動でこのメッセージも更新する
+        await pool.query(
+          'INSERT INTO vending_panels (message_id, channel_id, vending_id) VALUES ($1, $2, $3)',
+          [sentMessage.id, interaction.channelId, vendingId]
+        );
+
+        const noticeSuffix = panel.isEmpty ? '（現在商品は未登録です。vending-add で商品を追加すると自動的に反映されます）' : '';
+        return interaction.reply({ content: `自販機（ID: ${vendingId}）のパネルをこのチャンネルに設置しました。${noticeSuffix}`, ephemeral: true });
+      } catch (err) {
+        console.error(err);
+        return interaction.reply({ content: '自販機パネルの設置中にエラーが発生しました。', ephemeral: true });
       }
     }
 
@@ -683,6 +786,12 @@ client.on('interactionCreate', async interaction => {
         // 取引情報を削除
         await dbClient.query('DELETE FROM pending_transactions WHERE id = $1', [transactionId]);
         await dbClient.query('COMMIT');
+
+        // 在庫が変動した場合、この自販機IDの全設置パネルを自動更新する
+        if (isApprove) {
+          const affectedVendingId = (await pool.query('SELECT vending_id FROM products WHERE id = $1', [prodId])).rows[0]?.vending_id;
+          await refreshVendingPanels(affectedVendingId);
+        }
 
         const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
           .setColor(isApprove ? 0x00FF88 : 0xFF0000)
