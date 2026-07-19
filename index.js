@@ -53,6 +53,15 @@ async function initDb() {
       );
     `);
     await dbClient.query(`
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS infinite_stock BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+    await dbClient.query(`
+      CREATE TABLE IF NOT EXISTS vending_machines (
+        vending_id VARCHAR(255) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL
+      );
+    `);
+    await dbClient.query(`
       CREATE TABLE IF NOT EXISTS pending_transactions (
         id VARCHAR(255) PRIMARY KEY,
         user_id VARCHAR(255) NOT NULL,
@@ -165,14 +174,23 @@ async function getSettings() {
   }
 }
 
+// 自販機の表示名取得ヘルパー（vending-create で設定されていなければ番号のみ表示）
+async function getVendingMachineName(vendingId) {
+  const res = await pool.query('SELECT name FROM vending_machines WHERE vending_id = $1', [vendingId]);
+  return res.rows[0]?.name || null;
+}
+
 // 自販機パネル（embed + 購入ボタン）生成ヘルパー
 // 商品が0件の自販機IDでも「商品なし」パネルを返す（設置後に商品を追加すれば自動反映されるため）
 async function buildVendingPanel(vendingId) {
+  const machineName = await getVendingMachineName(vendingId);
+  const titleLabel = machineName ? `「${machineName}」(自販機 ${vendingId})` : `(自販機番号: ${vendingId})`;
+
   const res = await pool.query('SELECT * FROM products WHERE vending_id = $1', [vendingId]);
 
   if (res.rowCount === 0) {
     const embed = new EmbedBuilder()
-      .setTitle(`ShopKura オンライン自販機 (自販機ID: ${vendingId})`)
+      .setTitle(`ShopKura オンライン自販機 ${titleLabel}`)
       .setDescription('現在この自販機には商品が登録されていません。商品が追加され次第、このパネルは自動的に更新されます。')
       .setColor(0x8A2BE2)
       .setTimestamp();
@@ -180,7 +198,7 @@ async function buildVendingPanel(vendingId) {
   }
 
   const embed = new EmbedBuilder()
-    .setTitle(`ShopKura オンライン自販機 (自販機ID: ${vendingId})`)
+    .setTitle(`ShopKura オンライン自販機 ${titleLabel}`)
     .setDescription('購入したい商品の購入ボタンを押してください。お支払いはPayPay送金リンクのみ受け付けております。')
     .setColor(0x8A2BE2)
     .setTimestamp();
@@ -189,16 +207,18 @@ async function buildVendingPanel(vendingId) {
   let currentRow = new ActionRowBuilder();
 
   res.rows.forEach((prod, index) => {
+    const stockLabel = prod.infinite_stock ? '∞' : `${prod.stock ? prod.stock.length : 0} 個`;
     embed.addFields({
       name: `${prod.name} (${prod.price} 円)`,
-      value: `商品ID: ${prod.id} | 在庫: ${prod.stock ? prod.stock.length : 0} 個\n説明: ${prod.description}`
+      value: `商品ID: ${prod.id} | 在庫: ${stockLabel}\n説明: ${prod.description}`
     });
 
+    const outOfStock = !prod.infinite_stock && (!prod.stock || prod.stock.length === 0);
     const btn = new ButtonBuilder()
       .setCustomId(`buy_${prod.id}`)
       .setLabel(`購入: ${prod.name}`)
       .setStyle(ButtonStyle.Primary)
-      .setDisabled(!prod.stock || prod.stock.length === 0);
+      .setDisabled(outOfStock);
 
     currentRow.addComponents(btn);
 
@@ -254,6 +274,13 @@ const commands = [
     .addIntegerOption(option => option.setName('price').setDescription('価格（円）').setRequired(true))
     .addStringOption(option => option.setName('description').setDescription('商品の説明').setRequired(true))
     .addBooleanOption(option => option.setName('infinite_stock').setDescription('在庫を∞（無限）にする場合はTrue。売り切れなしで購入し続けられます').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('vending-create')
+    .setDescription('管理者用 自販機（1～10）に名前を付けて作成・変更します')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(option => option.setName('vending_id').setDescription('名前を設定する自販機番号（1～10）').setRequired(true).addChoices(...VENDING_ID_CHOICES))
+    .addStringOption(option => option.setName('name').setDescription('自販機の名前（例: ジュース自販機）').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('vending-delete')
@@ -350,24 +377,6 @@ client.on('guildCreate', async (guild) => {
 });
 
 client.on('interactionCreate', async interaction => {
-  // 自販機ID入力補完（複数設置している自販機IDを一覧から選択できるようにする）
-  if (interaction.isAutocomplete()) {
-    if (['vending-add', 'vending-list', 'vending-setup'].includes(interaction.commandName)) {
-      const focusedValue = interaction.options.getFocused() || '';
-      try {
-        const res = await pool.query(
-          'SELECT DISTINCT vending_id FROM products WHERE vending_id ILIKE $1 ORDER BY vending_id LIMIT 25',
-          [`%${focusedValue}%`]
-        );
-        await interaction.respond(res.rows.map(row => ({ name: row.vending_id, value: row.vending_id })));
-      } catch (err) {
-        console.error('自販機ID自動補完エラー:', err);
-        await interaction.respond([]).catch(() => null);
-      }
-    }
-    return;
-  }
-
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -378,14 +387,15 @@ client.on('interactionCreate', async interaction => {
       const name = interaction.options.getString('name');
       const price = interaction.options.getInteger('price');
       const description = interaction.options.getString('description');
+      const infiniteStock = interaction.options.getBoolean('infinite_stock') ?? false;
 
       try {
         await pool.query(`
-          INSERT INTO products (id, vending_id, name, price, description, stock)
-          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $1), '{}'::text[]))
+          INSERT INTO products (id, vending_id, name, price, description, stock, infinite_stock)
+          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $1), '{}'::text[]), $6)
           ON CONFLICT (id) DO UPDATE 
-          SET vending_id = EXCLUDED.vending_id, name = EXCLUDED.name, price = EXCLUDED.price, description = EXCLUDED.description;
-        `, [id, vendingId, name, price, description]);
+          SET vending_id = EXCLUDED.vending_id, name = EXCLUDED.name, price = EXCLUDED.price, description = EXCLUDED.description, infinite_stock = EXCLUDED.infinite_stock;
+        `, [id, vendingId, name, price, description, infiniteStock]);
 
         const embed = new EmbedBuilder()
           .setTitle('商品の追加または更新完了')
@@ -395,6 +405,7 @@ client.on('interactionCreate', async interaction => {
             { name: '自販機ID', value: vendingId, inline: true },
             { name: '商品名', value: name, inline: true },
             { name: '価格', value: `${price} 円`, inline: true },
+            { name: '在庫設定', value: infiniteStock ? '∞（無限）' : '通常（個数管理）', inline: true },
             { name: '説明', value: description }
           )
           .setTimestamp();
@@ -490,6 +501,35 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
+    // 4.6 vending-create（管理者用 自販機(1～10)に名前を付けて作成・変更する）
+    if (commandName === 'vending-create') {
+      const vendingId = interaction.options.getString('vending_id');
+      const machineName = interaction.options.getString('name');
+
+      try {
+        await pool.query(`
+          INSERT INTO vending_machines (vending_id, name)
+          VALUES ($1, $2)
+          ON CONFLICT (vending_id) DO UPDATE SET name = EXCLUDED.name;
+        `, [vendingId, machineName]);
+
+        const embed = new EmbedBuilder()
+          .setTitle('自販機の作成・名前変更が完了しました')
+          .setColor(0x00FF88)
+          .addFields(
+            { name: '自販機番号', value: vendingId, inline: true },
+            { name: '自販機の名前', value: machineName, inline: true }
+          )
+          .setDescription('この自販機番号に対して vending-add で商品を追加し、vending-setup でパネルを設置してください。既にこの番号のパネルが設置済みの場合は自動的に名前が反映されます。')
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(vendingId));
+      } catch (err) {
+        console.error(err);
+        return interaction.reply({ content: '自販機の作成中にエラーが発生しました。', ephemeral: true });
+      }
+    }
+
     // 5. ticket-setup
     if (commandName === 'ticket-setup') {
       const embed = new EmbedBuilder()
@@ -576,7 +616,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         const prod = res.rows[0];
-        if (!prod.stock || prod.stock.length === 0) {
+        if (!prod.infinite_stock && (!prod.stock || prod.stock.length === 0)) {
           return interaction.reply({ content: `${prod.name} は売り切れです。`, ephemeral: true });
         }
 
@@ -743,15 +783,21 @@ client.on('interactionCreate', async interaction => {
           }
 
           const prod = prodRes.rows[0];
-          if (!prod.stock || prod.stock.length === 0) {
-            throw new Error('商品の在庫がありません。');
+          let purchasedItem;
+
+          if (prod.infinite_stock) {
+            // 在庫∞商品：在庫配列は消費せず、テンプレートとして使い回す（vending-stockで登録した内容を毎回送信）
+            purchasedItem = (prod.stock && prod.stock.length > 0) ? prod.stock[0] : '(配布データ未登録。管理者に問い合わせてください)';
+          } else {
+            if (!prod.stock || prod.stock.length === 0) {
+              throw new Error('商品の在庫がありません。');
+            }
+            const stock = [...prod.stock];
+            purchasedItem = stock.shift();
+
+            // 在庫の更新（在庫∞商品は更新不要なので通常商品のみ）
+            await dbClient.query('UPDATE products SET stock = $1 WHERE id = $2', [stock, prodId]);
           }
-
-          const stock = [...prod.stock];
-          const purchasedItem = stock.shift();
-
-          // 在庫の更新
-          await dbClient.query('UPDATE products SET stock = $1 WHERE id = $2', [stock, prodId]);
 
           // DM送信処理
           if (buyer) {
