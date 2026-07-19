@@ -382,10 +382,10 @@ client.on('interactionCreate', async interaction => {
       try {
         await pool.query(`
           INSERT INTO products (id, vending_id, name, price, description, stock, infinite_stock)
-          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $1), '{}'::text[]), $6)
+          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $7), '{}'::text[]), $6)
           ON CONFLICT (id) DO UPDATE 
           SET vending_id = EXCLUDED.vending_id, name = EXCLUDED.name, price = EXCLUDED.price, description = EXCLUDED.description, infinite_stock = EXCLUDED.infinite_stock;
-        `, [id, vendingId, name, price, description, infiniteStock]);
+        `, [id, vendingId, name, price, description, infiniteStock, id]);
 
         const embed = new EmbedBuilder()
           .setTitle('商品の追加または更新完了')
