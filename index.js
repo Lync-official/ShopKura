@@ -68,6 +68,25 @@ async function initDb() {
       );
     `);
     await dbClient.query(`
+      ALTER TABLE pending_transactions ADD COLUMN IF NOT EXISTS channel_id VARCHAR(255);
+    `);
+    await dbClient.query(`
+      ALTER TABLE pending_transactions ADD COLUMN IF NOT EXISTS message_id VARCHAR(255);
+    `);
+    // PayPay送金リンクの使い回し（二重利用）を防ぐための恒久ログ。
+    // pending_transactionsは承認/却下/期限切れのたびに削除されるため、リンク単位の履歴はこちらで保持する。
+    await dbClient.query(`
+      CREATE TABLE IF NOT EXISTS payment_links (
+        paypay_url TEXT PRIMARY KEY,
+        status VARCHAR(20) NOT NULL,
+        transaction_id VARCHAR(255),
+        user_id VARCHAR(255),
+        product_id VARCHAR(255),
+        created_at BIGINT NOT NULL,
+        decided_at BIGINT
+      );
+    `);
+    await dbClient.query(`
       CREATE TABLE IF NOT EXISTS settings (
         key VARCHAR(255) PRIMARY KEY,
         vouch_channel_id VARCHAR(255),
@@ -204,8 +223,8 @@ async function buildVendingPanel(vendingId) {
     const priceLabel = Number(prod.price) === 0 ? '無料' : `${prod.price} 円`;
 
     embed.addFields({
-      name: `${prod.name} (${priceLabel})${outOfStock ? ' 【売り切れ】' : ''}`,
-      value: `商品ID: ${prod.id} | 在庫: ${stockLabel}\n説明: ${prod.description}`
+      name: `${prod.name}${outOfStock ? ' 【売り切れ】' : ''}`,
+      value: `価格: ${priceLabel}\n商品ID: ${prod.id} | 在庫: ${stockLabel}\n説明: ${prod.description}`
     });
   });
 
@@ -278,6 +297,63 @@ async function refreshAllVendingPanels() {
   }
 
   return result;
+}
+
+// 一定時間（PENDING_TRANSACTION_TIMEOUT_MS）が経過した購入申請を自動的に却下する。
+// PayPay送金リンクの受け取り有効期限（48時間）切れを放置してpending_transactionsに溜まり続けるのを防ぐためのもの。
+const PENDING_TRANSACTION_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24時間
+
+async function expireStalePendingTransactions() {
+  const cutoff = Date.now() - PENDING_TRANSACTION_TIMEOUT_MS;
+
+  let expiredRows;
+  try {
+    // created_at条件付きDELETEを直接使うことで、管理者が同時に承認/却下ボタンを押した場合との競合を避ける
+    // （どちらのDELETEが先にコミットされてもレコードは一意に消費される）
+    const res = await pool.query('DELETE FROM pending_transactions WHERE created_at < $1 RETURNING *', [cutoff]);
+    expiredRows = res.rows;
+  } catch (err) {
+    console.error('期限切れ購入申請の取得中にエラー:', err);
+    return;
+  }
+
+  if (expiredRows.length === 0) return;
+
+  for (const tx of expiredRows) {
+    try {
+      await pool.query(
+        "UPDATE payment_links SET status = 'expired', decided_at = $1 WHERE paypay_url = $2 AND status = 'pending'",
+        [Date.now(), tx.paypay_url]
+      );
+
+      const buyer = await client.users.fetch(tx.user_id).catch(() => null);
+      if (buyer) {
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('購入申請 期限切れのお知らせ')
+          .setDescription('一定時間が経過したため、購入申請は自動的に却下扱いとなりました。お手数ですが再度購入手続きを行ってください。')
+          .setColor(0x808080)
+          .setTimestamp();
+        await buyer.send({ embeds: [dmEmbed] }).catch(() => null);
+      }
+
+      if (tx.channel_id && tx.message_id) {
+        try {
+          const channel = await client.channels.fetch(tx.channel_id);
+          const message = await channel.messages.fetch(tx.message_id);
+          const updatedEmbed = EmbedBuilder.from(message.embeds[0])
+            .setColor(0x808080)
+            .setTitle('購入申請 期限切れ（自動却下）');
+          await message.edit({ embeds: [updatedEmbed], components: [] });
+        } catch (err) {
+          // メッセージが手動削除されている等は無視
+        }
+      }
+    } catch (err) {
+      console.error(`購入申請(${tx.id})の期限切れ処理中にエラー:`, err);
+    }
+  }
+
+  console.log(`購入申請の期限切れ自動処理: ${expiredRows.length} 件を自動却下しました。`);
 }
 
 // スラッシュコマンド定義
@@ -381,6 +457,12 @@ client.once('ready', async () => {
   // ログイン情報からアプリケーションID（クライアントID）を自動で取得
   const clientId = client.application.id;
   await registerCommands(clientId);
+
+  // 期限切れの購入申請（PayPay送金リンクの受け取り期限切れ放置など）を自動で却下扱いにする
+  await expireStalePendingTransactions().catch(err => console.error('期限切れ購入申請の初回処理エラー:', err));
+  setInterval(() => {
+    expireStalePendingTransactions().catch(err => console.error('期限切れ購入申請の定期処理エラー:', err));
+  }, 30 * 60 * 1000); // 30分ごとにチェック
 });
 
 // 新しいサーバーに追加されたときの処理
@@ -651,9 +733,9 @@ client.on('interactionCreate', async interaction => {
           const priceLabel = Number(prod.price) === 0 ? '無料' : `${prod.price}円`;
 
           return new StringSelectMenuOptionBuilder()
-            .setLabel(`${prod.name} (${priceLabel})`.slice(0, 100))
+            .setLabel(`${prod.name}${outOfStock ? ' 【売り切れ】' : ''}`.slice(0, 100))
             .setValue(prod.id)
-            .setDescription(`${outOfStock ? '【売り切れ】 ' : ''}在庫: ${stockLabel}`.slice(0, 100));
+            .setDescription(`価格: ${priceLabel} ｜ 在庫: ${stockLabel}`.slice(0, 100));
         });
 
         const selectMenu = new StringSelectMenuBuilder()
@@ -859,8 +941,12 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
-        // 取引情報を削除
+        // 取引情報を削除（payment_linksの方はリンクの再利用防止のため削除せず状態だけ更新して残す）
         await dbClient.query('DELETE FROM pending_transactions WHERE id = $1', [transactionId]);
+        await dbClient.query(
+          "UPDATE payment_links SET status = $1, decided_at = $2 WHERE paypay_url = $3",
+          [isApprove ? 'approved' : 'rejected', Date.now(), transactionData.paypay_url]
+        );
         await dbClient.query('COMMIT');
 
         // 在庫が変動した場合、この自販機IDの全設置パネルを自動更新する
@@ -1063,6 +1149,28 @@ client.on('interactionCreate', async interaction => {
 
         const transactionId = `tx_${Date.now()}_${interaction.user.id}`;
 
+        // 送金リンクの二重使用防止：同じpaypay_urlが既に処理中/承認済み/却下済み/期限切れであれば申請自体をブロックする。
+        // INSERT ... ON CONFLICT DO NOTHINGで原子的に「予約」するため、同時押しでも競合しない。
+        const linkClaim = await pool.query(
+          `INSERT INTO payment_links (paypay_url, status, transaction_id, user_id, product_id, created_at)
+           VALUES ($1, 'pending', $2, $3, $4, $5)
+           ON CONFLICT (paypay_url) DO NOTHING
+           RETURNING paypay_url`,
+          [paypayUrl, transactionId, interaction.user.id, prodId, Date.now()]
+        );
+
+        if (linkClaim.rowCount === 0) {
+          const existing = await pool.query('SELECT status FROM payment_links WHERE paypay_url = $1', [paypayUrl]);
+          const status = existing.rows[0]?.status;
+          const reasonMap = {
+            pending: 'このPayPay送金リンクは既に別の申請で処理中です。管理者の確認をお待ちください。',
+            approved: 'このPayPay送金リンクは既に使用（承認）済みです。',
+            rejected: 'このPayPay送金リンクは過去に却下されています。別の送金リンクをご用意ください。',
+            expired: 'このPayPay送金リンクは期限切れとして処理済みです。別の送金リンクをご用意ください。'
+          };
+          return interaction.editReply({ content: `申請を送信できませんでした: ${reasonMap[status] || 'このPayPay送金リンクは既に使用されています。'}` });
+        }
+
         // トランザクション情報を保存
         await pool.query(`
           INSERT INTO pending_transactions (id, user_id, product_id, paypay_url, created_at)
@@ -1098,7 +1206,11 @@ client.on('interactionCreate', async interaction => {
             .setStyle(ButtonStyle.Danger)
         );
 
-        await paymentChannel.send({ embeds: [requestEmbed], components: [buttons] });
+        const sentRequestMsg = await paymentChannel.send({ embeds: [requestEmbed], components: [buttons] });
+        await pool.query(
+          'UPDATE pending_transactions SET channel_id = $1, message_id = $2 WHERE id = $3',
+          [paymentChannel.id, sentRequestMsg.id, transactionId]
+        );
 
         const replyMsg = validation.unverifiable
           ? '購入申請を送信しました（今回は自動検証ができなかったため、管理者による手動確認となります）。しばらくお待ちください。'
