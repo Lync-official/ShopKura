@@ -14,6 +14,9 @@ module.exports = {
   // 認証機能: このロールが付与されると、プライベートチャンネル以外の全チャンネルが見えるようになる
   VERIFIED_ROLE_ID: process.env.VERIFIED_ROLE_ID || '1528290460932509729',
 
+  // 入退室ログを送信するチャンネル
+  JOIN_LEAVE_CHANNEL_ID: process.env.JOIN_LEAVE_CHANNEL_ID || '1528291559479709797',
+
   // 認証ロールを持っていても見えないままにしたいチャンネルID（カンマ区切りで.envに追加可能）
   // 例: PRIVATE_CHANNEL_IDS=111111111111111111,222222222222222222
   // 注: ticket-〇〇 という名前のチケットチャンネルは名前で自動的に除外されるため、ここに追加する必要はない

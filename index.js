@@ -13,6 +13,7 @@ const handleChatInputCommand = require('./src/handlers/chatInputCommandHandler')
 const handleButton = require('./src/handlers/buttonHandler');
 const handleModalSubmit = require('./src/handlers/modalHandler');
 const handleSelectMenu = require('./src/handlers/selectMenuHandler');
+const { buildJoinEmbed, buildLeaveEmbed } = require('./src/services/memberLogService');
 
 client.once('ready', async () => {
   console.log(`ログインしました: ${client.user.tag}`);
@@ -36,6 +37,28 @@ client.on('guildCreate', async (guild) => {
   if (guild.id !== config.ALLOWED_GUILD_ID) {
     console.log(`許可されていないサーバー (${guild.name} / ID: ${guild.id}) に追加されたため、即座に退出します。`);
     await guild.leave().catch(err => console.error('サーバー退出エラー:', err));
+  }
+});
+
+// 入退室ログ: メンバー参加
+client.on('guildMemberAdd', async (member) => {
+  try {
+    const logChannel = await client.channels.fetch(config.JOIN_LEAVE_CHANNEL_ID).catch(() => null);
+    if (!logChannel) return;
+    await logChannel.send({ embeds: [buildJoinEmbed(member)] });
+  } catch (err) {
+    console.error('入室ログ送信エラー:', err);
+  }
+});
+
+// 入退室ログ: メンバー退出
+client.on('guildMemberRemove', async (member) => {
+  try {
+    const logChannel = await client.channels.fetch(config.JOIN_LEAVE_CHANNEL_ID).catch(() => null);
+    if (!logChannel) return;
+    await logChannel.send({ embeds: [buildLeaveEmbed(member)] });
+  } catch (err) {
+    console.error('退室ログ送信エラー:', err);
   }
 });
 

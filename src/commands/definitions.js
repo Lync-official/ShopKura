@@ -29,6 +29,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('vending-list')
     .setDescription('指定した自販機の商品一覧を表示します')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(option => option.setName('vending_id').setDescription('表示する自販機の名前').setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
