@@ -44,6 +44,15 @@ async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_vending_panels_vending_id ON vending_panels (vending_id);
     `);
     await dbClient.query(`
+      CREATE TABLE IF NOT EXISTS oauth_users (
+        user_id VARCHAR(255) PRIMARY KEY,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await dbClient.query(`
       INSERT INTO settings (key, vouch_channel_id, payment_channel_id)
       VALUES ('guildSettings', NULL, NULL)
       ON CONFLICT (key) DO NOTHING;

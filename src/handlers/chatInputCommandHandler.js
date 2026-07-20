@@ -2,7 +2,7 @@ const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('
 const pool = require('../db/pool');
 const config = require('../config');
 const { buildVendingPanel, refreshVendingPanels, refreshAllVendingPanels } = require('../services/vendingService');
-const { lockdownGuildChannels } = require('../services/authService');
+const { lockdownGuildChannels, rejoinMember } = require('../services/authService');
 
 async function handleChatInputCommand(interaction) {
   const { commandName } = interaction;
@@ -222,19 +222,29 @@ async function handleChatInputCommand(interaction) {
     }
   }
 
-  // 9. verify-setup（管理者用 認証パネルの設置。ボタンを押すとその場で認証ロールが付与される）
+  // 9. verify-setup（管理者用 認証パネルの設置。直接OAuth2の連携リンクボタンを設置する）
   if (commandName === 'verify-setup') {
+    const clientId = config.DISCORD_CLIENT_ID || interaction.client.application?.id;
+    if (!clientId || !config.DISCORD_REDIRECT_URI) {
+      return interaction.reply({
+        content: 'Botの設定（環境変数 DISCORD_CLIENT_ID または DISCORD_REDIRECT_URI）が不足しているため、認証パネルを設置できません。',
+        ephemeral: true
+      });
+    }
+
+    const authUrl = `https://discord.com/oauth2/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(config.DISCORD_REDIRECT_URI)}&response_type=code&scope=identify+guilds.join`;
+
     const embed = new EmbedBuilder()
       .setTitle('サーバー認証')
-      .setDescription('下の「認証する」ボタンを押すと認証が完了し、サーバー内の各チャンネルが閲覧できるようになります。')
+      .setDescription('下の「認証する」ボタンを押してDiscordアカウントとの連携を承認してください。連携が完了すると自動的にサーバー内のチャンネルが閲覧できるようになります。')
       .setColor(0x5865F2)
       .setTimestamp();
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId('verify_button')
         .setLabel('認証する')
-        .setStyle(ButtonStyle.Success)
+        .setStyle(ButtonStyle.Link)
+        .setURL(authUrl)
     );
 
     return interaction.reply({ embeds: [embed], components: [row] });
@@ -262,6 +272,67 @@ async function handleChatInputCommand(interaction) {
     } catch (err) {
       console.error('チャンネル権限一括設定エラー:', err);
       return interaction.editReply({ content: '権限の一括設定中にエラーが発生しました。ボットのロール順位が認証ロールより上にあるか、チャンネル管理権限があるか確認してください。' });
+    }
+  // 11. verify-pull（管理者用 データベースから脱退メンバーを引き戻す）
+  if (commandName === 'verify-pull') {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      // DBから連携済みの全ユーザーIDを取得
+      const res = await pool.query('SELECT user_id FROM oauth_users');
+      if (res.rowCount === 0) {
+        return interaction.editReply({ content: 'OAuth2連携済みのユーザーがデータベースに登録されていません。' });
+      }
+
+      const userIds = res.rows.map(row => row.user_id);
+      const guild = interaction.guild;
+
+      // 現在サーバーにいないメンバーをフィルタリング
+      await guild.members.fetch().catch(() => {}); // キャッシュを最新にする
+
+      const missingUserIds = [];
+      for (const userId of userIds) {
+        if (!guild.members.cache.has(userId)) {
+          missingUserIds.push(userId);
+        }
+      }
+
+      if (missingUserIds.length === 0) {
+        return interaction.editReply({ content: '現在、脱退している連携済みユーザーはいません。全員サーバーに参加しています。' });
+      }
+
+      await interaction.editReply({ content: `${missingUserIds.length} 人の脱退メンバーを検知しました。順次引き戻し処理を開始します...` });
+
+      let successCount = 0;
+      let failCount = 0;
+
+      // 順次引き戻しを実行（Discord APIの負荷を抑えるために1.5秒のディレイを入れる）
+      for (const userId of missingUserIds) {
+        const success = await rejoinMember(guild.id, userId);
+        if (success) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+
+      const resultEmbed = new EmbedBuilder()
+        .setTitle('メンバー引き戻し処理 完了')
+        .setColor(0x00FF88)
+        .addFields(
+          { name: '対象人数', value: `${missingUserIds.length} 人`, inline: true },
+          { name: '成功', value: `${successCount} 人`, inline: true },
+          { name: '失敗', value: `${failCount} 人`, inline: true }
+        )
+        .setDescription('※失敗したユーザーは、連携アプリへのアクセス権限を取り消しているか、アカウントが削除されている可能性があります。')
+        .setTimestamp();
+
+      return interaction.followUp({ embeds: [resultEmbed], ephemeral: true }).catch(() => null);
+
+    } catch (err) {
+      console.error('メンバー引き戻しエラー:', err);
+      return interaction.editReply({ content: 'メンバーの引き戻し処理中にエラーが発生しました。' });
     }
   }
 }

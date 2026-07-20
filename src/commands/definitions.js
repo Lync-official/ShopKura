@@ -71,6 +71,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('verify-lockdown')
     .setDescription('管理者用 認証チャンネル以外の全チャンネルを「認証ロール保持者のみ閲覧可」に一括設定します')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('verify-pull')
+    .setDescription('管理者用 データベースに保存されたユーザーをチェックし、脱退しているメンバーを再追加します')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 

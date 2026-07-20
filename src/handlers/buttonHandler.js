@@ -164,21 +164,7 @@ async function handleButton(interaction) {
     await interaction.showModal(modal);
   }
 
-  // 認証ボタン：押すと認証ロールが付与される
-  if (interaction.customId === 'verify_button') {
-    try {
-      const result = await verifyMember(interaction.member);
 
-      if (result.alreadyVerified) {
-        return interaction.reply({ content: '既に認証済みです。', ephemeral: true });
-      }
-
-      return interaction.reply({ content: '認証が完了しました！サーバー内のチャンネルが閲覧できるようになりました。', ephemeral: true });
-    } catch (error) {
-      console.error('認証処理エラー:', error);
-      return interaction.reply({ content: '認証処理中にエラーが発生しました。ボットのロール順位が認証ロールより上に設定されているか、管理者に確認してください。', ephemeral: true });
-    }
-  }
 
   // 決済の承認・却下処理
   if (interaction.customId.startsWith('pay_approve_') || interaction.customId.startsWith('pay_reject_')) {

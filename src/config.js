@@ -4,6 +4,9 @@ module.exports = {
   DISCORD_TOKEN: process.env.DISCORD_TOKEN,
   DATABASE_URL: process.env.DATABASE_URL,
   PORT: process.env.PORT || 3000,
+  DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET,
+  DISCORD_REDIRECT_URI: process.env.DISCORD_REDIRECT_URI,
 
   // このサーバー以外には参加しない（自動退出する）
   ALLOWED_GUILD_ID: process.env.ALLOWED_GUILD_ID || '1528260161683062826',

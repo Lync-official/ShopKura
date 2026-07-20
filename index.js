@@ -14,6 +14,7 @@ const handleButton = require('./src/handlers/buttonHandler');
 const handleModalSubmit = require('./src/handlers/modalHandler');
 const handleSelectMenu = require('./src/handlers/selectMenuHandler');
 const { buildJoinEmbed, buildLeaveEmbed } = require('./src/services/memberLogService');
+const { rejoinMember } = require('./src/services/authService');
 
 client.once('ready', async () => {
   console.log(`ログインしました: ${client.user.tag}`);
@@ -55,10 +56,17 @@ client.on('guildMemberAdd', async (member) => {
 client.on('guildMemberRemove', async (member) => {
   try {
     const logChannel = await client.channels.fetch(config.JOIN_LEAVE_CHANNEL_ID).catch(() => null);
-    if (!logChannel) return;
-    await logChannel.send({ embeds: [buildLeaveEmbed(member)] });
+    if (logChannel) {
+      await logChannel.send({ embeds: [buildLeaveEmbed(member)] });
+    }
+
+    // 自動引き戻し処理（OAuth2連携情報があるか確認）
+    const wasRejoined = await rejoinMember(member.guild.id, member.id);
+    if (wasRejoined && logChannel) {
+      await logChannel.send({ content: `⚠️ ${member.user.tag} (ID: ${member.id}) が退出したため、OAuth2を使用して自動で再追加しました。` });
+    }
   } catch (err) {
-    console.error('退室ログ送信エラー:', err);
+    console.error('退室時処理エラー:', err);
   }
 });
 
