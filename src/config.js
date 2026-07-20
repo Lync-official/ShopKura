@@ -20,5 +20,12 @@ module.exports = {
   PRIVATE_CHANNEL_IDS: (process.env.PRIVATE_CHANNEL_IDS || '')
     .split(',')
     .map(s => s.trim())
+    .filter(Boolean),
+
+  // 管理者専用カテゴリ（このカテゴリ配下のチャンネルは verify-lockdown の対象外にし、
+  // 既存の管理者限定権限をそのまま維持する。カンマ区切りで複数指定可）
+  PRIVATE_CATEGORY_IDS: (process.env.PRIVATE_CATEGORY_IDS || '1528642100550438992')
+    .split(',')
+    .map(s => s.trim())
     .filter(Boolean)
 };

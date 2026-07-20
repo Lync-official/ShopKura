@@ -15,7 +15,8 @@ async function verifyMember(member) {
 // - 認証チャンネル(config.VERIFY_CHANNEL_ID): @everyone が見える状態にする
 // - それ以外の通常チャンネル: @everyone は見えない／認証ロールを持つ人だけ見える状態にする
 // - チケットチャンネル（"ticket-"から始まる名前。本人専用の個別権限を持つ）や
-//   PRIVATE_CHANNEL_IDS に指定したチャンネルはスキップし、手動管理のまま変更しない
+//   PRIVATE_CHANNEL_IDS に指定したチャンネル、PRIVATE_CATEGORY_IDS 配下のチャンネル
+//   （管理者専用カテゴリなど）はスキップし、既存の権限を手動管理のまま変更しない
 async function lockdownGuildChannels(guild) {
   const result = { updated: 0, skipped: 0, failed: 0 };
   const channels = await guild.channels.fetch();
@@ -25,8 +26,9 @@ async function lockdownGuildChannels(guild) {
 
     const isTicketChannel = typeof channel.name === 'string' && channel.name.startsWith('ticket-');
     const isExcluded = config.PRIVATE_CHANNEL_IDS.includes(channel.id);
+    const isInPrivateCategory = channel.parentId && config.PRIVATE_CATEGORY_IDS.includes(channel.parentId);
 
-    if (isTicketChannel || isExcluded) {
+    if (isTicketChannel || isExcluded || isInPrivateCategory) {
       result.skipped++;
       continue;
     }
