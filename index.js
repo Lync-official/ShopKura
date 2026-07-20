@@ -58,6 +58,10 @@ async function initDb() {
     await dbClient.query(`
       ALTER TABLE products ADD COLUMN IF NOT EXISTS infinite_stock BOOLEAN NOT NULL DEFAULT FALSE;
     `);
+    // 商品の受け取り方式: 'dm'（従来通りBotが自動でDM配布） / 'ticket'（購入時にチケットチャンネルを作成し管理者が手動対応）
+    await dbClient.query(`
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery_mode VARCHAR(10) NOT NULL DEFAULT 'dm';
+    `);
     await dbClient.query(`
       CREATE TABLE IF NOT EXISTS pending_transactions (
         id VARCHAR(255) PRIMARY KEY,
@@ -299,6 +303,59 @@ async function refreshAllVendingPanels() {
   return result;
 }
 
+// 受け取り方式が「ticket」の商品が購入された時に、購入者専用のチケットチャンネルを作成する。
+// 既存のticket-setup機能と同じ権限構成（@everyoneは非表示、購入者のみ閲覧可。Administrator権限を持つ管理者はDiscordの仕様上そのまま閲覧可能）を流用している。
+async function createPurchaseTicketChannel(guild, buyer, prod, purchasedItem) {
+  const sanitizedBase = `order-${buyer.username}-${prod.id}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 90) || `order-${buyer.id}`;
+
+  const ticketChannel = await guild.channels.create({
+    name: sanitizedBase,
+    type: ChannelType.GuildText,
+    permissionOverwrites: [
+      {
+        id: guild.id,
+        deny: [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: buyer.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+      }
+    ]
+  });
+
+  const priceLabel = Number(prod.price) === 0 ? '無料' : `${prod.price} 円`;
+
+  const embed = new EmbedBuilder()
+    .setTitle('ご購入ありがとうございます（チケット対応）')
+    .setDescription(`${buyer} さんが商品を購入されました。このあとスタッフが対応いたします。用件が済んだら下の「チケットを閉じる」ボタンを押してください。`)
+    .setColor(0x8A2BE2)
+    .addFields(
+      { name: '購入者', value: `${buyer} (${buyer.tag})`, inline: true },
+      { name: '商品名', value: prod.name, inline: true },
+      { name: '価格', value: priceLabel, inline: true }
+    )
+    .setTimestamp();
+
+  if (purchasedItem) {
+    embed.addFields({ name: 'スタッフ用メモ（登録済みデータ）', value: `\`\`\`${purchasedItem}\`\`\`` });
+  }
+
+  const closeBtn = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_close')
+      .setLabel('チケットを閉じる')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await ticketChannel.send({ content: `${buyer} 様`, embeds: [embed], components: [closeBtn] });
+
+  return ticketChannel;
+}
+
 // 一定時間（PENDING_TRANSACTION_TIMEOUT_MS）が経過した購入申請を自動的に却下する。
 // PayPay送金リンクの受け取り有効期限（48時間）切れを放置してpending_transactionsに溜まり続けるのを防ぐためのもの。
 const PENDING_TRANSACTION_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24時間
@@ -367,19 +424,42 @@ const commands = [
     .addStringOption(option => option.setName('name').setDescription('商品名').setRequired(true))
     .addIntegerOption(option => option.setName('price').setDescription('価格（円）').setRequired(true))
     .addStringOption(option => option.setName('description').setDescription('商品の説明').setRequired(true))
-    .addBooleanOption(option => option.setName('infinite_stock').setDescription('在庫を∞（無限）にする場合はTrue。売り切れなしで購入し続けられます').setRequired(false)),
+    .addBooleanOption(option => option.setName('infinite_stock').setDescription('在庫を∞（無限）にする場合はTrue。売り切れなしで購入し続けられます').setRequired(false))
+    .addStringOption(option => option.setName('delivery_mode')
+      .setDescription('受け取り方式（未指定ならDM自動送信）')
+      .setRequired(false)
+      .addChoices(
+        { name: 'DM自動送信（従来通り、購入後すぐにBotがDMで送信）', value: 'dm' },
+        { name: 'チケット対応（購入後にチケットチャンネルを作成し、管理者が手動対応）', value: 'ticket' }
+      )),
+
+  new SlashCommandBuilder()
+    .setName('vending-edit')
+    .setDescription('管理者用 既存商品の内容（商品名・価格・説明・受け取り方式）をIDで指定して編集します')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(option => option.setName('id').setDescription('編集する商品ID').setRequired(true).setAutocomplete(true))
+    .addStringOption(option => option.setName('name').setDescription('新しい商品名（変更する場合のみ指定）').setRequired(false))
+    .addIntegerOption(option => option.setName('price').setDescription('新しい価格（円）（変更する場合のみ指定）').setRequired(false))
+    .addStringOption(option => option.setName('description').setDescription('新しい商品説明（変更する場合のみ指定）').setRequired(false))
+    .addStringOption(option => option.setName('delivery_mode')
+      .setDescription('受け取り方式を変更する場合のみ指定')
+      .setRequired(false)
+      .addChoices(
+        { name: 'DM自動送信', value: 'dm' },
+        { name: 'チケット対応（管理者が手動対応）', value: 'ticket' }
+      )),
 
   new SlashCommandBuilder()
     .setName('vending-delete')
     .setDescription('管理者用 商品を削除します')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(option => option.setName('id').setDescription('削除する商品ID').setRequired(true)),
+    .addStringOption(option => option.setName('id').setDescription('削除する商品ID').setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName('vending-stock')
     .setDescription('管理者用 商品の在庫を追加します')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(option => option.setName('id').setDescription('対象の商品ID').setRequired(true))
+    .addStringOption(option => option.setName('id').setDescription('対象の商品ID').setRequired(true).setAutocomplete(true))
     .addStringOption(option => option.setName('items').setDescription('追加するアイテムデータ（カンマまたは改行区切り）').setRequired(true)),
 
   new SlashCommandBuilder()
@@ -495,6 +575,24 @@ client.on('interactionCreate', async interaction => {
         await interaction.respond([]).catch(() => null);
       }
     }
+
+    // 商品IDの入力補完（商品ID・商品名の両方で検索できるようにする）
+    if (['vending-edit', 'vending-delete', 'vending-stock'].includes(interaction.commandName)) {
+      const focusedValue = interaction.options.getFocused() || '';
+      try {
+        const res = await pool.query(
+          'SELECT id, name, price FROM products WHERE id ILIKE $1 OR name ILIKE $1 ORDER BY vending_id, name LIMIT 25',
+          [`%${focusedValue}%`]
+        );
+        await interaction.respond(res.rows.map(row => ({
+          name: `${row.id} | ${row.name} (${row.price}円)`.slice(0, 100),
+          value: row.id
+        })));
+      } catch (err) {
+        console.error('商品ID自動補完エラー:', err);
+        await interaction.respond([]).catch(() => null);
+      }
+    }
     return;
   }
 
@@ -509,14 +607,15 @@ client.on('interactionCreate', async interaction => {
       const price = interaction.options.getInteger('price');
       const description = interaction.options.getString('description');
       const infiniteStock = interaction.options.getBoolean('infinite_stock') ?? false;
+      const deliveryMode = interaction.options.getString('delivery_mode') ?? 'dm';
 
       try {
         await pool.query(`
-          INSERT INTO products (id, vending_id, name, price, description, stock, infinite_stock)
-          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $7), '{}'::text[]), $6)
+          INSERT INTO products (id, vending_id, name, price, description, stock, infinite_stock, delivery_mode)
+          VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT stock FROM products WHERE id = $7), '{}'::text[]), $6, $8)
           ON CONFLICT (id) DO UPDATE 
-          SET vending_id = EXCLUDED.vending_id, name = EXCLUDED.name, price = EXCLUDED.price, description = EXCLUDED.description, infinite_stock = EXCLUDED.infinite_stock;
-        `, [id, vendingId, name, price, description, infiniteStock, id]);
+          SET vending_id = EXCLUDED.vending_id, name = EXCLUDED.name, price = EXCLUDED.price, description = EXCLUDED.description, infinite_stock = EXCLUDED.infinite_stock, delivery_mode = EXCLUDED.delivery_mode;
+        `, [id, vendingId, name, price, description, infiniteStock, id, deliveryMode]);
 
         const embed = new EmbedBuilder()
           .setTitle('商品の追加または更新完了')
@@ -527,6 +626,7 @@ client.on('interactionCreate', async interaction => {
             { name: '商品名', value: name, inline: true },
             { name: '価格', value: price === 0 ? '無料' : `${price} 円`, inline: true },
             { name: '在庫設定', value: infiniteStock ? '∞（無限）' : '通常（個数管理）', inline: true },
+            { name: '受け取り方式', value: deliveryMode === 'ticket' ? 'チケット対応（管理者が手動対応）' : 'DM自動送信', inline: true },
             { name: '説明', value: description }
           )
           .setTimestamp();
@@ -535,6 +635,58 @@ client.on('interactionCreate', async interaction => {
       } catch (err) {
         console.error(err);
         return interaction.reply({ content: '商品の追加処理中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
+      }
+    }
+
+    // 1.5 vending-edit（商品IDを指定して、商品名・価格・説明・受け取り方式を個別に編集する）
+    if (commandName === 'vending-edit') {
+      const id = interaction.options.getString('id');
+      const newName = interaction.options.getString('name');
+      const newPrice = interaction.options.getInteger('price');
+      const newDescription = interaction.options.getString('description');
+      const newDeliveryMode = interaction.options.getString('delivery_mode');
+
+      if (newName === null && newPrice === null && newDescription === null && newDeliveryMode === null) {
+        return interaction.reply({ content: '変更する項目（name/price/description/delivery_mode）を少なくとも1つ指定してください。', flags: MessageFlags.Ephemeral });
+      }
+
+      try {
+        const existing = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        if (existing.rowCount === 0) {
+          return interaction.reply({ content: `商品ID: ${id} は存在しません。`, flags: MessageFlags.Ephemeral });
+        }
+        const prod = existing.rows[0];
+
+        // 指定されたフィールドのみを更新する（未指定の項目は既存の値を保持）
+        const updated = {
+          name: newName ?? prod.name,
+          price: newPrice ?? prod.price,
+          description: newDescription ?? prod.description,
+          delivery_mode: newDeliveryMode ?? prod.delivery_mode
+        };
+
+        await pool.query(
+          'UPDATE products SET name = $1, price = $2, description = $3, delivery_mode = $4 WHERE id = $5',
+          [updated.name, updated.price, updated.description, updated.delivery_mode, id]
+        );
+
+        const embed = new EmbedBuilder()
+          .setTitle('商品の編集が完了しました')
+          .setColor(0x00FF88)
+          .addFields(
+            { name: '商品ID', value: id, inline: true },
+            { name: '自販機名', value: prod.vending_id, inline: true },
+            { name: '商品名', value: updated.name, inline: true },
+            { name: '価格', value: Number(updated.price) === 0 ? '無料' : `${updated.price} 円`, inline: true },
+            { name: '受け取り方式', value: updated.delivery_mode === 'ticket' ? 'チケット対応（管理者が手動対応）' : 'DM自動送信', inline: true },
+            { name: '説明', value: updated.description }
+          )
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed] }).then(() => refreshVendingPanels(prod.vending_id));
+      } catch (err) {
+        console.error(err);
+        return interaction.reply({ content: '商品の編集中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -970,8 +1122,19 @@ client.on('interactionCreate', async interaction => {
             await dbClient.query('UPDATE products SET stock = $1::text[] WHERE id = $2', [stock, prodId]);
           }
 
-          // DM送信処理
-          if (buyer) {
+          // 配布処理：受け取り方式に応じてDM送信 or チケットチャンネル作成
+          if (prod.delivery_mode === 'ticket') {
+            if (!buyer) {
+              throw new Error('購入者情報が取得できず、チケットを作成できませんでした。');
+            }
+            try {
+              const ticketChannel = await createPurchaseTicketChannel(interaction.guild, buyer, prod, purchasedItem);
+              await buyer.send({ content: `ご購入ありがとうございます！担当者対応のため専用チケットを作成しました: ${ticketChannel}` }).catch(() => null);
+            } catch (err) {
+              console.error('購入チケット作成エラー:', err);
+              throw new Error('購入チケットチャンネルの作成に失敗しました。Botの権限（チャンネルの管理）を確認してください。');
+            }
+          } else if (buyer) {
             const dmEmbed = new EmbedBuilder()
               .setTitle('ご購入ありがとうございます')
               .setDescription(`${prodId} の購入申請が承認されました。以下が商品データです。`)
@@ -1075,21 +1238,26 @@ client.on('interactionCreate', async interaction => {
 
             await dbClient.query('COMMIT');
 
-            const dmEmbed = new EmbedBuilder()
-              .setTitle('ご購入ありがとうございます（無料商品）')
-              .setDescription(`${lockedProd.name} は無料商品のため、決済手続きなしで商品データをお届けします。`)
-              .setColor(0x8A2BE2)
-              .addFields(
-                { name: '購入商品ID', value: prodId, inline: true },
-                { name: '商品データ', value: `\`\`\`${deliveredItem}\`\`\`` }
-              )
-              .setTimestamp();
+            if (lockedProd.delivery_mode === 'ticket') {
+              const ticketChannel = await createPurchaseTicketChannel(interaction.guild, interaction.user, lockedProd, deliveredItem !== '(配布データ未登録。管理者に問い合わせてください)' ? deliveredItem : null);
+              await interaction.editReply({ content: `${lockedProd.name} のご購入ありがとうございます。専用チケットを作成しました: ${ticketChannel}`, embeds: [], components: [] });
+            } else {
+              const dmEmbed = new EmbedBuilder()
+                .setTitle('ご購入ありがとうございます（無料商品）')
+                .setDescription(`${lockedProd.name} は無料商品のため、決済手続きなしで商品データをお届けします。`)
+                .setColor(0x8A2BE2)
+                .addFields(
+                  { name: '購入商品ID', value: prodId, inline: true },
+                  { name: '商品データ', value: `\`\`\`${deliveredItem}\`\`\`` }
+                )
+                .setTimestamp();
 
-            await interaction.user.send({ embeds: [dmEmbed] }).catch(() => {
-              throw new Error('ユーザーへのDM送信に失敗しました。DMを開放してください。');
-            });
+              await interaction.user.send({ embeds: [dmEmbed] }).catch(() => {
+                throw new Error('ユーザーへのDM送信に失敗しました。DMを開放してください。');
+              });
 
-            await interaction.editReply({ content: `${lockedProd.name} を受け取りました。DMをご確認ください。`, embeds: [], components: [] });
+              await interaction.editReply({ content: `${lockedProd.name} を受け取りました。DMをご確認ください。`, embeds: [], components: [] });
+            }
 
             await refreshVendingPanels(lockedProd.vending_id);
           } catch (error) {
