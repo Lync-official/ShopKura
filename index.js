@@ -416,6 +416,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('決済確認チャンネル')
     .setDescription('管理者用 PayPay決済の承認リクエストを受け取るチャンネルに設定します')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('nuke')
+    .setDescription('管理者用 このチャンネルの人間によるメッセージを全て削除します（Botのメッセージは残ります）')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 
@@ -709,6 +714,60 @@ client.on('interactionCreate', async interaction => {
         console.error(err);
         return interaction.reply({ content: '設定の保存中にエラーが発生しました。', flags: MessageFlags.Ephemeral });
       }
+    }
+    // このチャンネルの人間によるメッセージのみを全て削除する（Botのメッセージ・自販機パネル等は保持）
+    if (commandName === 'nuke') {
+      const channel = interaction.channel;
+      if (!channel || !channel.isTextBased()) {
+        return interaction.reply({ content: 'このチャンネルではメッセージの削除を実行できません。', flags: MessageFlags.Ephemeral });
+      }
+
+      await interaction.reply({ content: '🧹 人間のメッセージを削除しています…チャンネルの履歴量によっては時間がかかります。', flags: MessageFlags.Ephemeral });
+
+      const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+      const MAX_BATCHES = 500; // 安全のための上限（1バッチ最大100件 = 最大5万件相当）
+      let totalDeleted = 0;
+      let lastId;
+
+      try {
+        for (let batch = 0; batch < MAX_BATCHES; batch++) {
+          const fetched = await channel.messages.fetch({ limit: 100, ...(lastId ? { before: lastId } : {}) });
+          if (fetched.size === 0) break;
+
+          lastId = fetched.last().id;
+
+          const humanMessages = fetched.filter(m => !m.author.bot);
+          const cutoff = Date.now() - TWO_WEEKS_MS;
+          const recent = humanMessages.filter(m => m.createdTimestamp > cutoff);
+          const old = humanMessages.filter(m => m.createdTimestamp <= cutoff);
+
+          // 14日以内のメッセージは一括削除（bulkDeleteは2件以上必要なため1件のみの場合は個別削除）
+          if (recent.size === 1) {
+            await recent.first().delete().catch(() => null);
+            totalDeleted += 1;
+          } else if (recent.size > 1) {
+            const deleted = await channel.bulkDelete(recent, true).catch(() => null);
+            totalDeleted += deleted ? deleted.size : 0;
+          }
+
+          // 14日を超えるメッセージはbulkDelete不可のAPI制限があるため1件ずつ削除（レート制限回避のウェイト付き）
+          for (const msg of old.values()) {
+            await msg.delete().catch(() => null);
+            totalDeleted += 1;
+            await new Promise(resolve => setTimeout(resolve, 350));
+          }
+
+          if (fetched.size < 100) break; // これ以上遡るメッセージがない
+        }
+
+        const doneMsg = await channel.send(`✅ 人間のメッセージの削除が完了しました。削除件数: ${totalDeleted} 件`);
+        setTimeout(() => doneMsg.delete().catch(() => null), 8000);
+      } catch (err) {
+        console.error('nukeコマンドエラー:', err);
+        const errMsg = await channel.send('❌ メッセージの削除中にエラーが発生しました（Botに「メッセージの管理」権限があるか確認してください）。').catch(() => null);
+        if (errMsg) setTimeout(() => errMsg.delete().catch(() => null), 8000);
+      }
+      return;
     }
   }
 
