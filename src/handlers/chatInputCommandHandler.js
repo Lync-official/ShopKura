@@ -273,6 +273,8 @@ async function handleChatInputCommand(interaction) {
       console.error('チャンネル権限一括設定エラー:', err);
       return interaction.editReply({ content: '権限の一括設定中にエラーが発生しました。ボットのロール順位が認証ロールより上にあるか、チャンネル管理権限があるか確認してください。' });
     }
+  }
+
   // 11. verify-pull（管理者用 データベースから脱退メンバーを引き戻す）
   if (commandName === 'verify-pull') {
     await interaction.deferReply({ ephemeral: true });
